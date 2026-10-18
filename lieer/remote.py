@@ -113,8 +113,8 @@ class Remote:
 
     ## messages.batchModify applies one label change to many messages in a
     ## single request (at most 1000 ids, a flat quota cost of 50 units), instead
-    ## of one messages.modify (5 units) per message. It only pays off for groups
-    ## of more than 10 messages, smaller groups use the individual requests.
+    ## of one messages.modify (5 units) per message. It is not cheaper for groups
+    ## of fewer than 10 messages, those use the individual requests.
     ##
     ## * https://developers.google.com/gmail/api/reference/rest/v1/users.messages/batchModify
     BATCH_MODIFY_SIZE = 1000
