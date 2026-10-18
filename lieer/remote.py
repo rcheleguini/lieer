@@ -15,6 +15,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import collections
 import json
 import os
 import time
@@ -109,6 +110,18 @@ class Remote:
     ## * https://developers.google.com/gmail/api/v1/reference/quota
     BATCH_REQUEST_SIZE = 50
     MIN_BATCH_REQUEST_SIZE = 1
+
+    ## messages.batchModify applies one label change to many messages in a
+    ## single request (at most 1000 ids, a flat quota cost of 50 units), instead
+    ## of one messages.modify (5 units) per message. It only pays off for groups
+    ## of more than 10 messages, smaller groups use the individual requests.
+    ##
+    ## * https://developers.google.com/gmail/api/reference/rest/v1/users.messages/batchModify
+    BATCH_MODIFY_SIZE = 1000
+    MIN_BATCH_MODIFY_GROUP = 10
+
+    # A label change for one message, as label ids (see __push_tags__)
+    Change = collections.namedtuple("Change", ["gid", "add", "rem"])
 
     class BatchException(Exception):
         pass
@@ -591,7 +604,7 @@ class Remote:
     def update(self, gmsg, nmsg, last_hist, force):
         """
         Gets a message and checks which labels it should add and which to delete, returns a
-        operation which can be submitted in a batch.
+        Remote.Change which can be submitted with push_changes ().
         """
 
         # DUPLICATES:
@@ -709,7 +722,8 @@ class Remote:
     @__require_auth__
     def __push_tags__(self, gid, add, rem):
         """
-        Push message changes
+        Resolve label names to ids (creating missing labels) and return a
+        Remote.Change.
         """
 
         _add = []
@@ -726,18 +740,82 @@ class Remote:
 
         _rem = [self.invlabels[r] for r in rem]
 
-        body = {"addLabelIds": _add, "removeLabelIds": _rem}
+        return Remote.Change(gid, tuple(sorted(_add)), tuple(sorted(_rem)))
 
+    def __modify_request__(self, change):
+        """
+        A single-message modify request for a change, for the batch HTTP path.
+        """
+        body = {"addLabelIds": list(change.add), "removeLabelIds": list(change.rem)}
         return (
             self.service.users()
             .messages()
-            .modify(userId=self.account, id=gid, body=body)
+            .modify(userId=self.account, id=change.gid, body=body)
         )
+
+    @__require_auth__
+    def __batch_modify__(self, gids, add, rem):
+        """
+        Apply the same label change to up to BATCH_MODIFY_SIZE messages.
+
+        Returns True when done. Returns False when the request was rejected
+        (e.g. an id that no longer exists), so that the caller can fall back
+        to updating the messages one by one.
+        """
+        body = {"ids": gids, "addLabelIds": list(add), "removeLabelIds": list(rem)}
+        while True:
+            self.__wait_delay__()
+            try:
+                self.service.users().messages().batchModify(
+                    userId=self.account, body=body
+                ).execute()
+                self.__request_done__(True)
+                return True
+            except googleapiclient.errors.HttpError as excep:
+                if excep.resp.status in (403, 429, 500, 502, 503, 504):
+                    self.__request_done__(False)
+                elif excep.resp.status in (400, 404):
+                    print(
+                        "remote: batchModify rejected (%s), updating messages one by one"
+                        % excep.resp.status
+                    )
+                    return False
+                else:
+                    raise
 
     @__require_auth__
     def push_changes(self, actions, cb):
         """
-        Push label changes
+        Push label changes: messages with the same change are updated together
+        with messages.batchModify, the rest one by one.
+        """
+        groups = {}
+        for a in actions:
+            groups.setdefault((a.add, a.rem), []).append(a)
+
+        singles = []
+        for (add, rem), changes in groups.items():
+            if len(changes) < self.MIN_BATCH_MODIFY_GROUP:
+                singles.extend(changes)
+                continue
+            for k in range(0, len(changes), self.BATCH_MODIFY_SIZE):
+                chunk = changes[k : k + self.BATCH_MODIFY_SIZE]
+                if self.__batch_modify__([c.gid for c in chunk], add, rem):
+                    for _ in chunk:
+                        cb(None)
+                else:
+                    singles.extend(chunk)
+
+        if singles:
+            self.__push_individually__(
+                [self.__modify_request__(c) for c in singles], cb
+            )
+
+    @__require_auth__
+    def __push_individually__(self, actions, cb):
+        """
+        Push label changes, one messages.modify request per message, sent in
+        HTTP batches.
         """
         max_req = self.BATCH_REQUEST_SIZE
         N = len(actions)
